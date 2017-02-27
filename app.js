@@ -1,132 +1,148 @@
 "use strict";
 
-const app = require('express')();
-const httpServer = require('http').createServer(app);
-const io = require('socket.io')(httpServer);
-const bodyParser = require('body-parser');
-const config = require('./config');
-const fs = require('fs');
+// const fs = require('fs');
 // const options = {
-//   key: fs.readFileSync(config.SSL_KEY),
-//   cert: fs.readFileSync(config.SSL_CERT)
+//   key: fs.readFileSync(process.env.SSL_KEY),
+//   cert: fs.readFileSync(process.env.SSL_CERT)
 // };
 // const httpsServer = require('https').createServer(options, app);
 
+const env = require('dotenv').config();
+
+const app = require('express')();
+const httpServer = require('http').createServer(app);
+const io = require('socket.io')(httpServer);
+
+const bodyParser = require('body-parser');
+
 const mongoose = require('mongoose');
-const pg = require('pg');
-const dbClient = new pg.Client(config.ANON_FL_DB);
+const jwt = require('jsonwebtoken');
 
 const Notification = require('./models/Notification');
-const _map = require('lodash.map');
 
 // init
 (() => {
-    httpServer.listen(config.HTTP_PORT);
-// httpsServer.listen(config.HTTPS_PORT);
+// httpsServer.listen(process.env.APP_HTTPS_PORT);
+    httpServer.listen(process.env.APP_HTTP_PORT);
+
     app.use(bodyParser.json());
     app.use(bodyParser.urlencoded({ extended: true }));
 
-    dbClient.connect(err => {
-        if (err) {
-            throw err;
-        }
-
-        console.log('DB: connection established');
-    });
-
-    mongoose.connect(`mongodb://${config.NOTIFICATION_DB.host}:${config.NOTIFICATION_DB.port}/${config.NOTIFICATION_DB.database}`, {
-        user: config.NOTIFICATION_DB.user,
-        pass: config.NOTIFICATION_DB.password
+    mongoose.connect(`mongodb://${process.env.NOTIFICATION_DB_HOST}:${process.env.NOTIFICATION_DB_PORT}/${process.env.NOTIFICATION_DB_NAME}`, {
+        user: process.env.NOTIFICATION_DB_USER,
+        pass: process.env.NOTIFICATION_DB_PASSWORD
     });
 })();
 
 
 io.on('connection', socket => {
-	const token = socket.request._query.token;
+    const token = socket.request._query.token;
 
-	if (!token) {
-		return;
-	}
+    if (!token) {
+        return;
+    }
 
-	// TODO: replace with JWT?
-	dbClient.query("SELECT user_id FROM authtoken_token WHERE key = $1::text", [token], (err, result) => {
-		if (err) {
-			throw err;
-		}
+    // TODO: use a cert
+    jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+        if (err) {
+            return;
+        }
 
-		const res = result.rows[0];
-		if (!res.hasOwnProperty('user_id')) {
-			return;
-		}
+        if (!decoded.hasOwnProperty('user_id')) {
+            return;
+        }
 
-        const user_id = res.user_id;
-		socket.user_id = user_id;
-		socket.chat_ids = [];
+        const {user_id} = decoded;
+        socket.user_id = user_id;
+        socket.chat_ids = [];
 
-		io.sockets.connected[user_id] = socket;
-        let notifications = [];
+        io.sockets.connected[user_id] = socket;
 
-		Notification.find({user_id, is_notified: false}, (err, result) => {
-            notifications = result;
-
-            if (!notifications.length) {
-                return;
-            }
-
-            const ids = _map(notifications, '_id');
-            Notification.update({_id: {$in: ids}}, {is_read: true}, {multi: true});
+        Notification.find({user_id, is_notified: false}, (err, result) => {
+            socket.emit('NEW_UNREAD_NOTIFICATIONS', result);
         });
+    });
 
-		socket.emit('NEW_UNREAD_NOTIFICATIONS', notifications);
+    socket.on('joinChat', ({chat_id}) => {
+        socket.chat_ids.push(chat_id);
+    });
 
-		console.log(`[user_id: ${socket.user_id}] joined`);
-	});
-
-	socket.on('joinChat', ({chat_id}) => {
-	    socket.chat_ids.push(chat_id);
-	});
-
-	socket.on('leaveChat', ({chat_id}) => {
+    socket.on('leaveChat', ({chat_id}) => {
         socket.chat_ids = socket.chat_ids.filter(_chat_id => _chat_id !== chat_id);
-	});
+    });
 
     const leave = () => {
         if (io.sockets.connected[socket.user_id] !== undefined) {
             delete io.sockets.connected[socket.user_id];
-            console.log(`[user_id: ${socket.user_id}] left`);
         }
     };
 
-	socket.on('leave', leave);
-	socket.on('disconnect', leave);
+    socket.on('leave', leave);
+    socket.on('disconnect', leave);
 });
 
 
 // TODO: client can send here any data, accept requests only from whitelisted ips (e.g., localhost)
 app.post('/notify', (req, res) => {
-	const {user_ids, data, key} = req.body;
+    const {user_ids, data, key, entity_id, token} = req.body;
 
-	user_ids.map(user_id => {
-        const is_connected = io.sockets.connected[user_id] !== undefined;
+    try {
+        jwt.verify(token, process.env.JWT_API_SERVICE_SECRET);
+    } catch (e) {
+        return res.json({
+            status: 'error',
+            detail: 'INVALID_JWT'
+        });
+    }
 
-        if (!is_connected) {
-            Notification.create({
-                type: key,
-                is_notified: false,
-                user_id,
-                data
-            }, (err, notification) => {
-                console.log(err);
-                console.log(notification);
-            });
+    user_ids.map(user_id => {
+        Notification.create({
+            type: key,
+            is_notified: false,
+            entity_id: entity_id,
+            user_id,
+            data
+        }, (err, notification) => {
+            console.log(err);
+        });
+
+        if (io.sockets.connected[user_id] !== undefined) {
+            io.sockets.connected[user_id].emit(key, data);    
+        }
+    });
+
+    res.json({
+        status: 'OK'
+    });
+});
+
+// mark notifications as read
+app.post('/notifications/read', (req, res) => {
+    const {user_id, token} = req.body;
+
+    try {
+        jwt.verify(token, process.env.JWT_API_SERVICE_SECRET);
+    } catch (e) {
+        return res.json({
+            status: 'error',
+            detail: 'INVALID_JWT'
+        });
+    }
+
+    Notification.find({user_id, is_notified: false}, {_id: 1}, (err, result) => {
+        let ids = result;
+
+        if (!ids.length) {
             return;
         }
 
-		io.sockets.connected[user_id].emit(key, data);
-		console.log(`Notify sent: [user_id: ${user_id}, event_key: ${key}]`);
-	});
+        ids = ids.map(id => new mongoose.Types.ObjectId(id._id));
 
-	res.json({
+        // for some reason, Notification.update() does not work as expected, use raw connection
+        mongoose.connection.db.collection('notifications').update({_id: {$in: ids}}, {$set: {is_notified: true}});
+    });
+
+    res.json({
         status: 'OK'
-	});
+    })
 });
