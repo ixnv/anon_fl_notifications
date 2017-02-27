@@ -1,0 +1,33 @@
+version: '2'
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    hostname: web
+    volumes:
+      - .:/app
+    command: ./run_web.sh
+    environment:
+      - NOTIFICATION_DB_HOST=db
+      - NOTIFICATION_DB_PORT=27017
+      - NOTIFICATION_DB_NAME=anon_fl
+      - NOTIFICATION_DB_USER=anon_fl
+      - NOTIFICATION_DB_PASSWORD=anon_fl
+      - APP_HTTP_PORT=8882
+      - APP_HTTPS_PORT=8843
+    links:
+      - db
+    depends_on:
+      - db
+    ports:
+        - "8888:8882"
+
+  db:
+    image: tutum/mongodb:3.2
+    hostname: db
+    environment:
+      - MONGODB_USER=anon_fl
+      - MONGODB_PASS=anon_fl
+      - MONGODB_DATABASE=anon_fl
